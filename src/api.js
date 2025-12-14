@@ -1,94 +1,133 @@
 /**
- * Sarvam API Wrapper
+ * Deep Translator API Wrapper
+ * Docs: https://deep-translator-api.azurewebsites.net/docs
  */
 
-const API_KEY = import.meta.env.VITE_SARVAM_API_KEY;
-const API_ENDPOINT = 'https://api.sarvam.ai/translate';
+const BASE_URL = '/api-proxy';
+
+// Map internal language codes (xx-IN) to standard codes for Google/MyMemory
+// Odia is 'or' in Google Translate, 'od' might be used elsewhere but 'or' is safer for Google.
+const LANG_MAP = {
+    'auto': 'auto',
+    'en-IN': 'en',
+    'hi-IN': 'hi',
+    'mr-IN': 'mr',
+    'bn-IN': 'bn',
+    'ta-IN': 'ta',
+    'te-IN': 'te',
+    'kn-IN': 'kn',
+    'ml-IN': 'ml',
+    'gu-IN': 'gu',
+    'pa-IN': 'pa',
+    'od-IN': 'or'
+};
+
+function getStandardCode(code) {
+    return LANG_MAP[code] || code.split('-')[0] || code;
+}
+
+// Provider configuration
+const PROVIDERS = [
+    {
+        name: 'google',
+        endpoint: '/google/',
+        payload: (text, src, tgt) => ({
+            text: text,
+            source: src,
+            target: tgt
+        })
+    },
+    {
+        name: 'mymemory',
+        endpoint: '/mymemory/',
+        payload: (text, src, tgt) => ({
+            text: text,
+            source: src,
+            target: tgt
+        })
+    }
+];
 
 export async function translateText(text, sourceLang, targetLang) {
     if (!text || !text.trim()) return '';
 
-    // Split text by newlines to preserve formatting and handle list items individually
+    const sourceCode = getStandardCode(sourceLang);
+    const targetCode = getStandardCode(targetLang);
+
+    // Split text by newlines
     const lines = text.split('\n');
 
-    // Batch processing to avoid rate limiting
-    // Switching to BATCH_SIZE = 1 (Sequential) to ensure 100% reliability as per user request.
-    const BATCH_SIZE = 1;
-    const DELAY_BETWEEN_BATCHES = 500; // 0.5 second delay between lines
-    const MAX_RETRIES = 5; // Increased retries for stubborn lines
+    // Sequential Processing settings
+    const DELAY_BETWEEN_LINES = 500; // 0.5s delay
+    const MAX_RETRIES = 5;
 
     const translatedLines = new Array(lines.length);
 
-    // Helper for delay
+    // Helper: Delay
     const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // Helper for translation with retry
-    const translateLineWithRetry = async (line, globalIndex, attempt = 1) => {
-        if (!line.trim()) {
-            return line;
-        }
+    // Helper: Translate Single Line with Provider Fallback & Retries
+    const translateLine = async (line, globalIndex) => {
+        if (!line.trim()) return line;
 
-        const payload = {
-            input: line,
-            source_language_code: sourceLang === 'auto' ? 'auto' : sourceLang,
-            target_language_code: targetLang,
-            model: "mayura:v1"
-        };
+        // Try providers in order
+        for (const provider of PROVIDERS) {
 
-        try {
-            const response = await fetch(API_ENDPOINT, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-subscription-key': API_KEY
-                },
-                body: JSON.stringify(payload)
-            });
+            // Retry loop for current provider
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                try {
+                    const response = await fetch(`${BASE_URL}${provider.endpoint}`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(provider.payload(line, sourceCode, targetCode))
+                    });
 
-            if (!response.ok) {
-                if (attempt < MAX_RETRIES) {
-                    // Exponential backoff: 1s, 2s, 4s
-                    const backoff = 1000 * Math.pow(2, attempt - 1);
-                    console.warn(`Line ${globalIndex} failed (Attempt ${attempt}). Retrying in ${backoff}ms...`);
-                    await delay(backoff);
-                    return translateLineWithRetry(line, globalIndex, attempt + 1);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+
+                    const data = await response.json();
+
+                    // Specific check for validation errors or empty responses
+                    if (!data || (!data.translation && !data.translated_text)) {
+                        throw new Error('Empty translation response');
+                    }
+
+                    return data.translation || data.translated_text;
+
+                } catch (err) {
+                    console.warn(`[${provider.name}] Line ${globalIndex} failed (Attempt ${attempt}):`, err);
+
+                    if (attempt < MAX_RETRIES) {
+                        // Exponential backoff
+                        await delay(1000 * Math.pow(2, attempt - 1));
+                    }
                 }
-                throw new Error(`API Error: ${response.status}`);
             }
-
-            const data = await response.json();
-            return data.translated_text || data.output || line;
-
-        } catch (error) {
-            console.error(`Sarvam API Error for line ${globalIndex} (Attempt ${attempt}):`, error);
-            if (attempt < MAX_RETRIES) {
-                const backoff = 1000 * Math.pow(2, attempt - 1);
-                await delay(backoff);
-                return translateLineWithRetry(line, globalIndex, attempt + 1);
-            }
-            return line; // Fallback to original
+            // If we exhaust retries for this provider, loop continues to next provider
+            console.warn(`Provider ${provider.name} failed for line ${globalIndex}. Switching provider...`);
         }
+
+        // If all providers fail
+        console.error(`All providers failed for line ${globalIndex}. Returning original.`);
+        return line;
     };
 
-    for (let i = 0; i < lines.length; i += BATCH_SIZE) {
-        const batch = lines.slice(i, i + BATCH_SIZE);
-        const batchPromises = batch.map((line, index) => {
-            const globalIndex = i + index;
-            // Execute translation and assign to correct index
-            return translateLineWithRetry(line, globalIndex).then(result => {
-                translatedLines[globalIndex] = result;
-            });
-        });
 
-        // Wait for the current batch to complete
-        await Promise.all(batchPromises);
+    // Sequential Loop
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
 
-        // Add delay between batches if it's not the last batch
-        if (i + BATCH_SIZE < lines.length) {
-            await delay(DELAY_BETWEEN_BATCHES);
+        // Translate
+        translatedLines[i] = await translateLine(line, i);
+
+        // Delay (except last line)
+        if (i < lines.length - 1) {
+            await delay(DELAY_BETWEEN_LINES);
         }
     }
 
-    // Join them back with newlines to match input orientation
     return translatedLines.join('\n');
 }
